@@ -1,0 +1,220 @@
+"""Preprocessing execution engine using MNE.
+
+Executes a PipelinePlan deterministically, handling channel ladder alignment,
+polyphase resampling, notch/bandpass filtering, scaling, windowing, and normalization.
+Outputs (N, C, T) PyTorch tensors.
+"""
+
+from __future__ import annotations
+
+import warnings
+from pathlib import Path
+
+import mne
+import numpy as np
+import torch
+
+from nneeg.contracts import FMContract, get_contract
+from nneeg.planner import PipelinePlan
+from nneeg.utils.channels import (
+    interpolate_missing_channels,
+    match_channel_to_target,
+)
+from nneeg.utils.determinism import set_seed
+from nneeg.utils.io import discover_eeg_files, load_raw_file
+
+
+def _apply_channel_ladder(
+    raw: mne.io.BaseRaw,
+    plan: PipelinePlan,
+    expected_channels: list[str],
+) -> mne.io.BaseRaw:
+    """Apply channel ladder step (native subset vs spherical spline interpolation)."""
+    channel_step = plan.channel_step
+
+    if channel_step.action == "error_insufficient_channels":
+        raise ValueError(f"Cannot preprocess EEG: {channel_step.reason}")
+
+    # First clean and map channel names
+    rename_dict: dict[str, str] = {}
+    for ch in raw.ch_names:
+        matched = match_channel_to_target(ch, expected_channels)
+        if matched and matched != ch:
+            rename_dict[ch] = matched
+
+    if rename_dict:
+        raw.rename_channels(rename_dict)
+
+    if channel_step.action == "spherical_spline_interpolation":
+        raw = interpolate_missing_channels(raw, expected_channels)
+
+    # Pick and strictly reorder to match FM contract channel order
+    raw.pick(expected_channels)
+    raw.reorder_channels(expected_channels)
+    return raw
+
+
+def _apply_filtering(
+    raw: mne.io.BaseRaw,
+    plan: PipelinePlan,
+) -> mne.io.BaseRaw:
+    """Apply deterministic resampling, notch, and bandpass filters."""
+    # Resample if planned
+    if plan.resample_step.action == "resample_poly":
+        target_fs = float(plan.resample_step.parameters["target_fs"])
+        if abs(raw.info["sfreq"] - target_fs) > 1e-3:
+            raw.resample(target_fs, npad="auto", verbose=False)
+
+    # Notch filter if planned
+    if plan.notch_step.action == "apply_notch":
+        freqs = plan.notch_step.parameters["frequencies"]
+        notch_widths = plan.notch_step.parameters.get("notch_widths", 2.0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            raw.notch_filter(
+                freqs=freqs,
+                notch_widths=notch_widths,
+                phase="zero",
+                fir_design="firwin",
+                verbose=False,
+            )
+
+    # Bandpass filter if planned
+    if plan.bandpass_step.action == "apply_bandpass":
+        l_freq = plan.bandpass_step.parameters.get("l_freq")
+        h_freq = plan.bandpass_step.parameters.get("h_freq")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            raw.filter(
+                l_freq=l_freq,
+                h_freq=h_freq,
+                phase="zero",
+                fir_design="firwin",
+                verbose=False,
+            )
+
+    return raw
+
+
+def _window_and_normalize(
+    data: np.ndarray,
+    plan: PipelinePlan,
+) -> torch.Tensor:
+    """Slice continuous (C, total_T) signal into (N, C, T) windows and normalize."""
+    n_channels, total_t = data.shape
+    window_samples = int(plan.windowing_step.parameters["window_samples"])
+    stride_samples = int(plan.windowing_step.parameters.get("stride_samples", window_samples))
+
+    if total_t >= window_samples:
+        n_windows = (total_t - window_samples) // stride_samples + 1
+        windows = np.zeros((n_windows, n_channels, window_samples), dtype=np.float32)
+        for i in range(n_windows):
+            start = i * stride_samples
+            end = start + window_samples
+            windows[i] = data[:, start:end]
+    else:
+        # Zero-pad short recordings to at least one full window
+        pad_width = window_samples - total_t
+        padded = np.pad(data, ((0, 0), (0, pad_width)), mode="constant")
+        windows = padded[np.newaxis, :, :].astype(np.float32)
+
+    tensor = torch.from_numpy(windows)
+
+    # Apply normalization
+    norm_action = plan.normalization_step.action
+    if norm_action == "zscore_per_channel":
+        eps = float(plan.normalization_step.parameters.get("epsilon", 1e-8))
+        mean = tensor.mean(dim=-1, keepdim=True)
+        std = tensor.std(dim=-1, keepdim=True)
+        std = torch.where(std < eps, torch.ones_like(std), std)
+        tensor = (tensor - mean) / std
+
+    return tensor
+
+
+def preprocess_raw(
+    raw: mne.io.BaseRaw,
+    plan: PipelinePlan,
+    contract: FMContract | None = None,
+    seed: int = 42,
+) -> torch.Tensor:
+    """Preprocess an in-memory MNE Raw object according to a PipelinePlan.
+
+    Parameters
+    ----------
+    raw : mne.io.BaseRaw
+        Raw EEG instance.
+    plan : PipelinePlan
+        Execution plan generated by planner.
+    contract : Optional[FMContract]
+        FM Contract instance (retrieved from registry if None).
+    seed : int
+        Random seed for deterministic execution.
+
+    Returns
+    -------
+    torch.Tensor
+        Output tensor of shape (N, C, T) where:
+        N = number of windows/epochs,
+        C = number of expected channels in contract,
+        T = window_samples in contract.
+    """
+    set_seed(seed)
+    if contract is None:
+        contract = get_contract(plan.contract_name)
+
+    expected_channels = list(contract.expected_channels)
+    raw_work = raw.copy().load_data()
+
+    # Step 1: Channel handling ladder
+    raw_work = _apply_channel_ladder(raw_work, plan, expected_channels)
+
+    # Step 2: Resampling & Filtering
+    raw_work = _apply_filtering(raw_work, plan)
+
+    # Step 3: Extract data and apply amplitude scaling
+    data = raw_work.get_data()
+    if plan.scaling_step.action == "scale_uV":
+        scale_factor = float(plan.scaling_step.parameters.get("scale_factor", 1e6))
+        data = data * scale_factor
+
+    # Step 4: Windowing and Normalization
+    tensor = _window_and_normalize(data, plan)
+    return tensor
+
+
+def preprocess_dataset(
+    source: str | Path,
+    plan: PipelinePlan,
+    contract: FMContract | None = None,
+    seed: int = 42,
+) -> torch.Tensor:
+    """Preprocess an entire dataset from disk according to a PipelinePlan.
+
+    Parameters
+    ----------
+    source : str | Path
+        Path to a single EEG file or directory of EEG files.
+    plan : PipelinePlan
+        Execution plan generated by planner.
+    contract : Optional[FMContract]
+        FM Contract instance (retrieved from registry if None).
+    seed : int
+        Random seed for deterministic execution.
+
+    Returns
+    -------
+    torch.Tensor
+        Concatenated PyTorch tensor of shape (N_total, C, T).
+    """
+    files = discover_eeg_files(source)
+    if not files:
+        raise FileNotFoundError(f"No valid EEG files found at: {source}")
+
+    tensors: list[torch.Tensor] = []
+    for fp in files:
+        raw = load_raw_file(fp, preload=True)
+        t = preprocess_raw(raw, plan, contract=contract, seed=seed)
+        tensors.append(t)
+
+    return torch.cat(tensors, dim=0)
